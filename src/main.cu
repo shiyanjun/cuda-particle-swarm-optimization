@@ -27,42 +27,96 @@ by Ivan Vinogradov
 #include <thrust/reduce.h>
 #include <thrust/sort.h>
 
-#include "common.cuh"
 #include "particle.cuh"
 
-// Window size, center, zoom, function min-max, time
-__constant__ int devWidth;
-__constant__ int devHeight;
-__constant__ int devParticleSize;
-__constant__ double devCenterX;
-__constant__ double devCenterY;
-__constant__ double devZoomX;
-__constant__ double devZoomY;
-__constant__ double devTimeValue;
-__constant__ double devTimeStep;
+#define CSC(call) {                                                        \
+  cudaError err = call;                                                    \
+  if (err != cudaSuccess) {                                                \
+    fprintf(stderr, "CUDA error in file '%s' in line %i: %s.\n", __FILE__, \
+    __LINE__, cudaGetErrorString(err));                                    \
+    exit(1);                                                               \
+  }                                                                        \
+}                                                                          \
+while (0)
 
-// Parameters of uniform space partitioning
-__constant__ double devUniformSpaceMinX;
-__constant__ double devUniformSpaceMaxX;
-__constant__ double devUniformSpaceMinY;
-__constant__ double devUniformSpaceMaxY;
-__constant__ double devUniformSpaceCellSize;
+#define DEBUG false
+
+#define GLOBAL_COEFF    0.000050   // coefficient of global solution
+#define LOCAL_COEFF     0.00000010 // coefficient of local solution
+#define RANDOM_COEFF    0.010      // coefficient of random motion
+#define DAMPING_COEFF   0.99250    // coefficient of damping force
+#define REPULSION_COEFF 0.10       // coefficient of repulsive force
+
+// CUDA grid
+dim3 blocks_2d(16, 16);
+dim3 threads_2d(32, 32);
+dim3 blocks_1d(16);
+dim3 threads_1d(1024);
+
+// Number of particles
+int numberOfParticles = 1000;
+
+// Window size
+int width = 1024, height = 640;
+
+// Particle size
+int particleSize = 1;
+
+// Cell size for uniform space partitioning
+float cellSize = 5.0;
+
+// Center, zoom
+float centerX = 0.0;
+float centerY = 0.0;
+float zoomX = 10000.0;
+float zoomY = zoomX * height / width;
+
+// Time
+float timeValue = 0.0;
+float timeStep = 0.001;
+
+// Automatic centering (press key Q to switch)
+bool autoCenter = true;
+
+// OpenGL buffer
+GLuint vbo;
+
+// CUDA resource for OpenGL output
+struct cudaGraphicsResource *res;
 
 Particle *devParticleArray;
 ParticleArea *devPartileAreaArray;
 curandState *devRandomState;
 
+// Window size, center, zoom, function min-max, time
+__constant__ int devWidth;
+__constant__ int devHeight;
+__constant__ int devParticleSize;
+__constant__ float devCenterX;
+__constant__ float devCenterY;
+__constant__ float devZoomX;
+__constant__ float devZoomY;
+__constant__ float devTimeValue;
+__constant__ float devTimeStep;
+
+// Parameters of uniform space partitioning
+__constant__ float devUniformSpaceMinX;
+__constant__ float devUniformSpaceMaxX;
+__constant__ float devUniformSpaceMinY;
+__constant__ float devUniformSpaceMaxY;
+__constant__ float devUniformSpaceCellSize;
+
 // Screen coordinates into real coordinates
 __device__
-double2 indexToCoord(int2 index) {
-  return make_double2(
-    (2.0f * index.x / (double)(devWidth - 1) - 1.0f) * devZoomX + devCenterX,
-    -(2.0f * index.y / (double)(devHeight - 1) - 1.0f) * devZoomY + devCenterY);
+float2 indexToCoord(int2 index) {
+  return make_float2(
+    (2.0f * index.x / (float)(devWidth - 1) - 1.0f) * devZoomX + devCenterX,
+    -(2.0f * index.y / (float)(devHeight - 1) - 1.0f) * devZoomY + devCenterY);
 }
 
 // Real coordinates into screen coordinates
 __device__
-int2 coordToIndex(double2 coord) {
+int2 coordToIndex(float2 coord) {
   return make_int2(
     0.5f * (devWidth - 1) * (1.0f + (coord.x - devCenterX) / devZoomX),
     0.5f * (devHeight - 1) * (1.0f - (coord.y - devCenterY) / devZoomY)
@@ -71,12 +125,12 @@ int2 coordToIndex(double2 coord) {
 
 /*  Schwefel Function */
 __device__
-double fun(double2 coord) {
+float fun(float2 coord) {
   return -coord.x * sin(sqrt(fabs(coord.x))) - coord.y * sin(sqrt(fabs(coord.y)));
 }
 
 __device__
-double fun(int2 index) {
+float fun(int2 index) {
   return fun(indexToCoord(index));
 }
 
@@ -93,24 +147,20 @@ __global__
 void kernelSwarmInit(Particle *particles, int n, curandState *state) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   int offsetx = blockDim.x * gridDim.x;
-  Particle *p;
+  Particle p;
   for (int i = idx; i < n; i += offsetx) {
-    p = &particles[i];
+    p = particles[i];
 
     // Position in the center of the screen
-    p->coords = p->best_coords = indexToCoord(make_int2(devWidth / 2, devHeight / 2));
-
-    // // Random position within the screen
-    // p->coords = p->best_coords = indexToCoord(make_int2(
-    //   curand_uniform_double(&state[i]) * devWidth,
-    //   curand_uniform_double(&state[i]) * devHeight
-    // ));
+    p.coords = p.best_coords = indexToCoord(make_int2(devWidth / 2, devHeight / 2));
 
     // Random starting angle and the speed
-    double angle = 2.0 * 3.14 * curand_uniform_double(&state[i]);
-    double speed = 100.0 * curand_uniform_double(&state[i]);
-    p->speed = make_double2(cos(angle) * speed, sin(angle) * speed);
-    p->value = p->best_value = DBL_MAX;
+    float angle = 2.0 * 3.14 * curand_uniform(&state[i]);
+    float speed = 100.0 * curand_uniform(&state[i]);
+    p.speed = make_float2(cos(angle) * speed, sin(angle) * speed);
+    p.value = p.best_value = FLT_MAX;
+
+    particles[i] = p;
   }
 }
 
@@ -119,26 +169,27 @@ void kernelSwarmUpdate(uchar4 *image, Particle *particles, int n) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   int offsetx = blockDim.x * gridDim.x;
 
-  Particle *p;
+  Particle p;
 
   for (int i = idx; i < n; i += offsetx) {
-    p = &particles[i];
-    p->value = fun(p->coords);
-    if (p->value < p->best_value) {
-      p->best_value = p->value;
-      p->best_coords = p->coords;
+    p = particles[i];
+    p.value = fun(p.coords);
+    if (p.value < p.best_value) {
+      p.best_value = p.value;
+      p.best_coords = p.coords;
     }
+    particles[i] = p;
   }
 }
 
 __global__
-void kernelNormalizedHeatMap(uchar4 *heatMap, double minValue, double maxValue) {
+void kernelNormalizedHeatMap(uchar4 *heatMap, float minValue, float maxValue) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   int idy = blockIdx.y * blockDim.y + threadIdx.y;
   int offsetx = blockDim.x * gridDim.x;
   int offsety = blockDim.y * gridDim.y;
   int i, j;
-  double f;
+  float f;
   for (i = idx; i < devWidth; i += offsetx) {
     for (j = idy; j < devHeight; j += offsety) {
       f = (fun(make_int2(i, j)) - minValue) / (maxValue - minValue);
@@ -184,33 +235,34 @@ void kernelSwarmAssociateWithCells(Particle *particles, int n) {
   int sizeX = ceil((devUniformSpaceMaxX - devUniformSpaceMinX) / devUniformSpaceCellSize);
   int sizeY = ceil((devUniformSpaceMaxY - devUniformSpaceMinY) / devUniformSpaceCellSize);
 
-  Particle *p;
+  Particle p;
   int cellX, cellY;
 
   for (int i = idx; i < n; i += offsetx) {
-    p = &particles[i];
-    cellX = (p->coords.x - devUniformSpaceMinX) / devUniformSpaceCellSize;
-    cellY = (p->coords.y - devUniformSpaceMinY) / devUniformSpaceCellSize;
-    p->cellIndex = cellX * sizeX + cellY;
+    p = particles[i];
+    cellX = (p.coords.x - devUniformSpaceMinX) / devUniformSpaceCellSize;
+    cellY = (p.coords.y - devUniformSpaceMinY) / devUniformSpaceCellSize;
+    p.cellIndex = cellX * sizeX + cellY;
+    particles[i] = p;
   }
 }
 
 // The total force of repulsion for the i-th particle (without the space partitioning)
 __device__
-double2 calculateRepulsionAll(Particle *particles, int n, int i) {
-  double2 repulsion, diff, coords_a, coords_b;
-  double distance;
+float2 calculateRepulsionAll(Particle *particles, int n, int i) {
+  float2 repulsion, diff, coords_a, coords_b;
+  float distance;
 
   // TODO
-  double minDistance = DBL_MAX;
+  float minDistance = FLT_MAX;
 
   repulsion.x = 0.0;
   repulsion.y = 0.0;
-  coords_a = (&particles[i])->coords;
+  coords_a = particles[i].coords;
 
   for (int j = 0; j < n; j++) {
     if (j == i) continue;
-    coords_b = (&particles[j])->coords;
+    coords_b = particles[j].coords;
     diff.x = coords_a.x - coords_b.x;
     diff.y = coords_a.y - coords_b.y;
     distance = sqrt(diff.x * diff.x + diff.y * diff.y);
@@ -233,9 +285,6 @@ double2 calculateRepulsionAll(Particle *particles, int n, int i) {
     printf("distance: %lf; interactions: %d\n", minDistance, n);
   }
   
-  // TODO
-  // repulsion.x /= n;
-  // repulsion.y /= n;
   return repulsion;
 }
 
@@ -268,12 +317,12 @@ int findParticleByCell(Particle *particles, int size, int cellIndex) {
 
 // The total force of repulsion for the i-th particle (with the space partitioning)
 __device__
-double2 calculateRepulsionClosest(Particle *particles, int n, int i) {
-  double2 diff, repulsion = make_double2(0.0, 0.0);
-  double distance;
+float2 calculateRepulsionClosest(Particle *particles, int n, int i) {
+  float2 diff, repulsion = make_float2(0.0, 0.0);
+  float distance;
 
   // TODO
-  double minDistance = DBL_MAX;
+  float minDistance = FLT_MAX;
 
   // Counter of interacting particles
   int counter = 0;
@@ -285,15 +334,13 @@ double2 calculateRepulsionClosest(Particle *particles, int n, int i) {
   if (sizeX < 1) sizeX = 1;
   if (sizeY < 1) sizeY = 1;
 
-  Particle *pa, *pb;
+  Particle pa, pb;
 
-  pa = &particles[i];
-
-  int cellIndex = pa->cellIndex;
+  pa = particles[i];
 
   // TODO: деление на ноль
-  int cellX = cellIndex / sizeX;
-  int cellY = cellIndex % sizeX;
+  int cellX = pa.cellIndex / sizeX;
+  int cellY = pa.cellIndex % sizeX;
 
   int radius = 1;
   for (int x = cellX - radius; x <= cellX + radius; x++) {
@@ -305,11 +352,11 @@ double2 calculateRepulsionClosest(Particle *particles, int n, int i) {
         for (int k = neighborIndex; k < n; k++)
         {
           if (k == i) continue;
-          pb = &particles[k];
-          if (pb->cellIndex != neighborCellIndex) break;
+          pb = particles[k];
+          if (pb.cellIndex != neighborCellIndex) break;
 
-          diff.x = pa->coords.x - pb->coords.x;
-          diff.y = pa->coords.y - pb->coords.y;
+          diff.x = pa.coords.x - pb.coords.x;
+          diff.y = pa.coords.y - pb.coords.y;
 
           distance = sqrt(diff.x * diff.x + diff.y * diff.y);
 
@@ -336,64 +383,57 @@ double2 calculateRepulsionClosest(Particle *particles, int n, int i) {
     printf("distance: %lf; interactions: %d\n", minDistance, counter);
   }
 
-  // TODO
-  // if (counter > 1) {
-  //   repulsion.x /= counter;
-  //   repulsion.y /= counter;
-  // }
-
   return repulsion;
 }
 
 __global__
 void kernelSwarmMove(uchar4 *image, Particle *particles, int n,
-                     double2 global_minimum, curandState *state) {
+                     float2 global_minimum, curandState *state) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   int offsetx = blockDim.x * gridDim.x;
 
-  const double g_coeff = 0.000050;     // coefficient of global solution
-  const double p_coeff = 0.00000010;   // coefficient of local solution
-  const double rnd_coeff = 0.010;      // coefficient of random motion
-  const double damping_coeff = 0.991;  // coefficient of damping force
-  const double repulsion_coeff = 0.10; // coefficient of repulsive force
+  // The speed_coeff drops from 5 to 0.01 depending on the time
+  float speed_coeff = 5.0 / (1.0 + 0.1 * pow(devTimeValue, 4));
+  speed_coeff = speed_coeff < 0.01 ? 0.01 : speed_coeff;
 
-  // The speed drops to 0.1 depending on the time
-  double speed_coeff = 1.0 / (1.0 + 0.01 * pow(devTimeValue, 4));
-  speed_coeff = speed_coeff < 0.1 ? 0.1 : speed_coeff;
+  if (DEBUG && idx == 0) {
+    printf("speed_coeff: %lf\n", speed_coeff);
+  }
 
-  double rnd_1, rnd_2, rnd_3, rnd_4;
-  Particle *p;
-  double2 repulsion;
+  float rnd_1, rnd_2, rnd_3, rnd_4;
+  Particle p;
+  float2 repulsion;
 
   for (int i = idx; i < n; i += offsetx) {
-    rnd_1 = curand_uniform_double(&state[i]);
-    rnd_2 = curand_uniform_double(&state[i]);
-    rnd_3 = curand_uniform_double(&state[i]);
-    rnd_4 = curand_uniform_double(&state[i]);
+    rnd_1 = curand_uniform(&state[i]);
+    rnd_2 = curand_uniform(&state[i]);
+    rnd_3 = curand_uniform(&state[i]);
+    rnd_4 = curand_uniform(&state[i]);
 
-    p = &particles[i];
+    p = particles[i];
 
-    p->speed.x = damping_coeff * p->speed.x +
+    p.speed.x = DAMPING_COEFF * p.speed.x +
                  speed_coeff * (
-                   rnd_1 * p_coeff * (p->best_coords.x - p->coords.x) +
-                   rnd_2 * g_coeff * (global_minimum.x - p->coords.x) +
-                   rnd_coeff * (rnd_3 - 0.5)
+                   rnd_1 * LOCAL_COEFF * (p.best_coords.x - p.coords.x) +
+                   rnd_2 * GLOBAL_COEFF * (global_minimum.x - p.coords.x) +
+                   RANDOM_COEFF * (rnd_3 - 0.5)
                  );
 
-    p->speed.y = damping_coeff * p->speed.y +
+    p.speed.y = DAMPING_COEFF * p.speed.y +
                  speed_coeff * (
-                   rnd_1 * p_coeff * (p->best_coords.y - p->coords.y) +
-                   rnd_2 * g_coeff * (global_minimum.y - p->coords.y) +
-                   rnd_coeff * (rnd_4 - 0.5)
+                   rnd_1 * LOCAL_COEFF * (p.best_coords.y - p.coords.y) +
+                   rnd_2 * GLOBAL_COEFF * (global_minimum.y - p.coords.y) +
+                   RANDOM_COEFF * (rnd_4 - 0.5)
                  );
 
-    // repulsion = calculateRepulsionAll(particles, n, i);
     repulsion = calculateRepulsionClosest(particles, n, i);
-    p->speed.x += repulsion_coeff * repulsion.x;
-    p->speed.y += repulsion_coeff * repulsion.y;
+    p.speed.x += REPULSION_COEFF * repulsion.x;
+    p.speed.y += REPULSION_COEFF * repulsion.y;
 
-    p->coords.x += p->speed.x;
-    p->coords.y += p->speed.y;
+    p.coords.x += p.speed.x;
+    p.coords.y += p.speed.y;
+
+    particles[i] = p;
   }
 }
 
@@ -403,8 +443,8 @@ void copySizeToGPU() {
 }
 
 void copyZoomToGPU() {
-  CSC(cudaMemcpyToSymbol((const void *)&devZoomX, &zoomX, sizeof(double)));
-  CSC(cudaMemcpyToSymbol((const void *)&devZoomY, &zoomY, sizeof(double)));
+  CSC(cudaMemcpyToSymbol((const void *)&devZoomX, &zoomX, sizeof(float)));
+  CSC(cudaMemcpyToSymbol((const void *)&devZoomY, &zoomY, sizeof(float)));
 }
 
 void copyParticleSizeToGPU() {
@@ -412,21 +452,21 @@ void copyParticleSizeToGPU() {
 }
 
 void copyCenterToGPU() {
-  CSC(cudaMemcpyToSymbol((const void *)&devCenterX, &centerX, sizeof(double)));
-  CSC(cudaMemcpyToSymbol((const void *)&devCenterY, &centerY, sizeof(double)));
+  CSC(cudaMemcpyToSymbol((const void *)&devCenterX, &centerX, sizeof(float)));
+  CSC(cudaMemcpyToSymbol((const void *)&devCenterY, &centerY, sizeof(float)));
 }
 
 void copyTimeToGPU() {
-  CSC(cudaMemcpyToSymbol((const void *)&devTimeValue, &timeValue, sizeof(double)));
-  CSC(cudaMemcpyToSymbol((const void *)&devTimeStep, &timeStep, sizeof(double)));
+  CSC(cudaMemcpyToSymbol((const void *)&devTimeValue, &timeValue, sizeof(float)));
+  CSC(cudaMemcpyToSymbol((const void *)&devTimeStep, &timeStep, sizeof(float)));
 }
 
-void copyUniformSpaceToGPU(double minX, double maxX, double minY, double maxY, double cellSize) {
-  CSC(cudaMemcpyToSymbol((const void *)&devUniformSpaceMinX, &minX, sizeof(double)));
-  CSC(cudaMemcpyToSymbol((const void *)&devUniformSpaceMaxX, &maxX, sizeof(double)));
-  CSC(cudaMemcpyToSymbol((const void *)&devUniformSpaceMinY, &minY, sizeof(double)));
-  CSC(cudaMemcpyToSymbol((const void *)&devUniformSpaceMaxY, &maxY, sizeof(double)));
-  CSC(cudaMemcpyToSymbol((const void *)&devUniformSpaceCellSize, &cellSize, sizeof(double)));
+void copyUniformSpaceToGPU(float minX, float maxX, float minY, float maxY, float cellSize) {
+  CSC(cudaMemcpyToSymbol((const void *)&devUniformSpaceMinX, &minX, sizeof(float)));
+  CSC(cudaMemcpyToSymbol((const void *)&devUniformSpaceMaxX, &maxX, sizeof(float)));
+  CSC(cudaMemcpyToSymbol((const void *)&devUniformSpaceMinY, &minY, sizeof(float)));
+  CSC(cudaMemcpyToSymbol((const void *)&devUniformSpaceMaxY, &maxY, sizeof(float)));
+  CSC(cudaMemcpyToSymbol((const void *)&devUniformSpaceCellSize, &cellSize, sizeof(float)));
 }
 
 void copyToGPU() {
@@ -457,15 +497,15 @@ void update() {
   thrust::device_ptr<ParticleArea> endParticleAreaArray = startParticleAreaArray + numberOfParticles;
 
   ParticleArea pa;
-  pa.min_x = DBL_MAX ;
-  pa.min_y = DBL_MAX ;
-  pa.max_x = -DBL_MAX ;
-  pa.max_y = -DBL_MAX ;
+  pa.min_x = FLT_MAX ;
+  pa.min_y = FLT_MAX ;
+  pa.max_x = -FLT_MAX ;
+  pa.max_y = -FLT_MAX ;
   pa.sum_x = 0.0;
   pa.sum_y = 0.0;
-  pa.minValue = DBL_MAX ;
-  pa.maxValue = -DBL_MAX ;
-  pa.globalMinimum = DBL_MAX ;
+  pa.minValue = FLT_MAX ;
+  pa.maxValue = -FLT_MAX ;
+  pa.globalMinimum = FLT_MAX ;
 
   kernelInitParticleArea<<<blocks_1d, threads_1d>>>(
     devParticleArray, devPartileAreaArray, numberOfParticles
@@ -522,6 +562,45 @@ void display() {
   glutSwapBuffers();
 }
 
+void reshapeFunc(int w, int h) {
+  width = w;
+  height = h;
+  zoomY = zoomX * height / width;
+
+  glBufferData(GL_PIXEL_UNPACK_BUFFER_ARB, width * height * sizeof(uchar4), NULL, GL_DYNAMIC_DRAW);
+  CSC(cudaGraphicsGLRegisterBuffer(&res, vbo, cudaGraphicsMapFlagsWriteDiscard));
+}
+
+void keyboardFunc(unsigned char key, int xmouse, int ymouse) {
+  switch (key) {
+    case 'w':
+      centerY -= 0.1f * zoomY; break;
+    case 'a':
+      centerX -= 0.1f * zoomX; break;
+    case 's':
+      centerY += 0.1f * zoomY; break;
+    case 'd':
+      centerX += 0.1f * zoomX; break;
+    case 'q':
+      autoCenter = autoCenter ? false : true; break;
+    case 45:
+      particleSize -= 1; break;
+    case 61:
+      particleSize += 1; break;
+    default: break;
+  }
+
+  if (particleSize < 0) particleSize = 0;
+  else if (particleSize > 100) particleSize = 100;
+}
+
+void mouseWheelFunc(int wheel, int direction, int x, int y) {
+  zoomX += direction < 0 ? 0.1 * zoomX : -0.1 * zoomX;
+  if (zoomX < 0.01) zoomX = 0.01;
+  else if (zoomX > 1000000) zoomX = 1000000;
+  zoomY = zoomX * height / width;
+}
+
 int main(int argc, char **argv) {
 
   std::cout << "Enter window width: ";
@@ -540,7 +619,7 @@ int main(int argc, char **argv) {
 
   cudaMalloc((void **)&devRandomState, sizeof(curandState) * numberOfParticles);
   cudaMalloc((void **)&devParticleArray, sizeof(Particle) * numberOfParticles);
-  cudaMalloc((void **)&devPartileAreaArray, sizeof(Particle) * numberOfParticles);
+  cudaMalloc((void **)&devPartileAreaArray, sizeof(ParticleArea) * numberOfParticles);
 
   initRandomState<<<blocks_1d, threads_1d>>>(devRandomState, numberOfParticles);
   kernelSwarmInit<<<blocks_1d, threads_1d>>>(devParticleArray, numberOfParticles, devRandomState);
@@ -561,13 +640,10 @@ int main(int argc, char **argv) {
   gluOrtho2D(0.0, (GLdouble)width, 0.0, (GLdouble)height);
 
   glewInit();
-
-  GLuint vbo;
   glGenBuffers(1, &vbo);
   glBindBuffer(GL_PIXEL_UNPACK_BUFFER_ARB, vbo);
-  glBufferData(GL_PIXEL_UNPACK_BUFFER_ARB, width * height * sizeof(uchar4), NULL, GL_DYNAMIC_DRAW);
 
-  CSC(cudaGraphicsGLRegisterBuffer(&res, vbo, cudaGraphicsMapFlagsWriteDiscard));
+  reshapeFunc(width, height);
 
   glutMainLoop();
 
@@ -576,6 +652,7 @@ int main(int argc, char **argv) {
   glBindBuffer(1, vbo);
   glDeleteBuffers(1, &vbo);
 
+  cudaFree(devRandomState);
   cudaFree(devParticleArray);
   cudaFree(devRandomState);
 

@@ -1,23 +1,29 @@
+/*
+Particle swarm optimization
+by Ivan Vinogradov
+2016
+*/
+
 struct Particle {
-  double2 coords;
-  double2 best_coords;
-  double2 speed;
-  double value;
-  double best_value;
+  float2 coords;
+  float2 best_coords;
+  float2 speed;
+  float value;
+  float best_value;
   int cellIndex;
 };
 
 struct ParticleArea {
-  double min_x;
-  double max_x;
-  double min_y;
-  double max_y;
-  double sum_x;
-  double sum_y;
-  double minValue;
-  double maxValue;
-  double globalMinimum;
-  double2 globalMinimumCoords;
+  float min_x;
+  float max_x;
+  float min_y;
+  float max_y;
+  float sum_x;
+  float sum_y;
+  float minValue;
+  float maxValue;
+  float globalMinimum;
+  float2 globalMinimumCoords;
 };
 
 /* Thrust sorting comparator */
