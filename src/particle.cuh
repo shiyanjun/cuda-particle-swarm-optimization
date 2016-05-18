@@ -64,20 +64,23 @@ __global__
 void kernelInitParticleArea(Particle *particleArray, ParticleArea *particleAreaArray, int size) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   int offsetx = blockDim.x * gridDim.x;
-  Particle *p;
-  ParticleArea *pa;
+  Particle p;
+  ParticleArea pa;
   for (int i = idx; i < size; i += offsetx) {
-    p = &particleArray[i];
-    pa = &particleAreaArray[i];
-    pa->min_x = p->coords.x;
-    pa->min_y = p->coords.y;
-    pa->max_x = p->coords.x;
-    pa->max_y = p->coords.y;
-    pa->sum_x = p->coords.x;
-    pa->sum_y = p->coords.y;
-    pa->minValue = p->value;
-    pa->maxValue = p->value;
-    pa->globalMinimum = p->best_value;
-    pa->globalMinimumCoords = p->best_coords;
+    p = particleArray[i];
+    pa = particleAreaArray[i];
+
+    pa.min_x = p.coords.x;
+    pa.min_y = p.coords.y;
+    pa.max_x = p.coords.x;
+    pa.max_y = p.coords.y;
+    pa.sum_x = p.coords.x;
+    pa.sum_y = p.coords.y;
+    pa.minValue = p.value;
+    pa.maxValue = p.value;
+    pa.globalMinimum = p.best_value;
+    pa.globalMinimumCoords = p.best_coords;
+
+    particleAreaArray[i] = pa;
   }
 }
